@@ -8,19 +8,21 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Install C Packages and OpenSSL Headers
+      - name: Install C Packages and Musl Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libssl-dev pkg-config
+          sudo apt-get install -y build-essential libssl-dev pkg-config musl-tools
 
       - name: Setup Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
-      - name: Build Optimized Release Binary
-        run: cargo build --release
+      - name: Build Optimized Static Release Binary
+        run: cargo build --release --target x86_64-unknown-linux-musl
 
       - name: Upload Finished Binary
         uses: actions/upload-artifact@v4
         with:
           name: ghost-nas-linux
-          path: target/release/ghost-nas
+          path: target/x86_64-unknown-linux-musl/release/ghost-nas
