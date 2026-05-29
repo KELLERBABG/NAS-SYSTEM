@@ -1,0 +1,72 @@
+# TrueNAS SCALE App Configuration for GHOST NAS
+# This is the ix_values.yaml for the TrueNAS SCALE App Catalog
+# Installed via Apps → Launch Docker Image → Custom App
+
+image:
+  repository: ghcr.io/ghost-nas/ghost-nas
+  tag: latest
+  pullPolicy: Always
+
+# GHOST NAS Configuration
+config:
+  node:
+    nickname: "GHOST-NAS-Node"
+    identityPath: "/mnt/ghost-config/identity.key"
+    allowedPeers: []
+  truenas:
+    middlewareUrl: "http://localhost:8080/api/v2.0"
+    apiKey: ""
+    autoProvisionDataset: true
+    zfsPool: "tank"
+    healthCheckIntervalSecs: 30
+  vault:
+    mountPath: "/mnt/ghost-vault"
+    datasetName: "tank/ghost-vault"
+    quota: "100G"
+    encryption: true
+    shardTtlSecs: 86400
+    replicationFactor: 3
+  network:
+    udpPort: 0
+    tcpPort: 9001
+    bootstrapPeers: []
+    distributed: true
+  session:
+    hardTimeoutSecs: 86400
+    idleTimeoutSecs: 1800
+    windowSize: 128
+  api:
+    listenAddr: "0.0.0.0"
+    listenPort: 9443
+    enableCors: true
+
+# Host Path Volumes for TrueNAS SCALE
+volumes:
+  - name: ghost-config
+    hostPath: "/mnt/tank/ghost-config"
+    mountPath: "/mnt/ghost-config"
+    description: "Persistent GHOST configuration and identity keys"
+  - name: ghost-vault
+    hostPath: "/mnt/tank/ghost-vault"
+    mountPath: "/mnt/ghost-vault"
+    description: "BHS vault dataset for encrypted shard storage"
+  - name: ghost-ipc
+    hostPath: "/run/ghost"
+    mountPath: "/run/ghost"
+    description: "IPC socket directory for frontend communication"
+
+# Network configuration
+network:
+  hostNetwork: true
+  dnsConfig:
+    - 1.1.1.1
+    - 8.8.8.8
+
+# Resource limits
+resources:
+  limits:
+    cpu: 2
+    memory: 2Gi
+  requests:
+    cpu: 500m
+    memory: 512Mi
