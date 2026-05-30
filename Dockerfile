@@ -14,6 +14,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /build
 
+# Ordnerstruktur bereits in der Builder-Stage vorbereiten
+RUN mkdir -p ./dist/mnt/ghost-vault ./dist/mnt/ghost-config ./dist/run/ghost ./dist/usr/share/ghost-nas/webui
+
 # Copy manifests first for layer caching
 COPY Cargo.toml ./
 COPY src/ ./src/
@@ -24,19 +27,13 @@ RUN cargo build --release --locked
 # ── Runtime Stage ──
 FROM gcr.io/distroless/cc-debian12:latest
 
+# Die vorbereitete Ordnerstruktur aus dem Builder kopieren (umgeht das fehlende mkdir)
+COPY --from=builder /build/dist /
+
 # Copy GHOST NAS binary
 COPY --from=builder /build/target/release/ghost-nas /usr/local/bin/ghost-nas
 
-# Create required directories
-RUN mkdir -p /mnt/ghost-vault /mnt/ghost-config /run/ghost /usr/share/ghost-nas/webui
-
-# Copy default web UI (can be extended with a React/Vue dashboard)
-# COPY webui/ /usr/share/ghost-nas/webui/
-
 # Expose ports
-#   UDP: 0-65535 (ephemeral for P2P)
-#   TCP: 9001 (bulk transfer)
-#   HTTP: 9443 (TrueNAS middleware API)
 EXPOSE 9001/tcp 9443/tcp
 
 # Labels for TrueNAS SCALE Catalog
