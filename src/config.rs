@@ -7,21 +7,18 @@ use directories::ProjectDirs;
 pub struct GhostConfig {
     /// General node identity
     pub node: NodeConfig,
-
     /// TrueNAS SCALE middleware bridge settings
     pub truenas: TrueNASConfig,
-
     /// ZFS Vault (Black-Hole Storage) dataset configuration
     pub vault: VaultConfig,
-
     /// Peer discovery and DHT
     pub network: NetworkConfig,
-
     /// Session policy
     pub session: SessionConfig,
-
-    /// HTTP API (axum) for TrueNAS middleware integration
+    /// HTTP API / WebDAV / Web UI
     pub api: ApiConfig,
+    /// NAS filesystem + WAN routing
+    pub nas: NasConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +65,7 @@ pub struct VaultConfig {
 pub struct NetworkConfig {
     /// UDP listen port (0 = OS picks random ephemeral)
     pub udp_port: u16,
-    /// TCP listen port for peer-to-peer bulk transfer
+    /// TCP listen port for bulk shard transfer between WAN peers
     pub tcp_port: u16,
     /// DHT bootstrap nodes (host:port)
     pub bootstrap_peers: Vec<String>,
@@ -88,15 +85,42 @@ pub struct SessionConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
-    /// HTTP API listen address
+    /// HTTP API / WebDAV / WebUI listen address
     pub listen_addr: String,
     /// API port
     pub listen_port: u16,
-    /// Enable CORS for TrueNAS web UI integration
+    /// Enable CORS for web UI integration
     pub enable_cors: bool,
     /// Path to TLS cert for HTTPS (optional — leave empty for HTTP)
     pub tls_cert_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
+}
+
+/// NAS filesystem configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NasConfig {
+    /// Share name visible to clients (e.g. "GHOST")
+    pub share_name: String,
+    /// Block size for file sharding in bytes (default: 1MB = 1048576)
+    pub shard_block_size: usize,
+    /// Number of data shards for RS encoding
+    pub rs_data_shards: usize,
+    /// Number of parity shards for RS encoding
+    pub rs_parity_shards: usize,
+    /// WAN peer routing table: peer_nickname -> (address, public_key_hex)
+    pub wan_peers: Vec<WanPeer>,
+    /// Path to the encrypted directory tree database
+    pub directory_db_path: PathBuf,
+    /// Minimum number of shards required to reconstruct a file block
+    pub reconstruct_threshold: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WanPeer {
+    pub nickname: String,
+    pub address: String,
+    pub public_key_hex: String,
+    pub geo_tag: String,
 }
 
 impl Default for GhostConfig {
@@ -139,6 +163,15 @@ impl Default for GhostConfig {
                 enable_cors: true,
                 tls_cert_path: None,
                 tls_key_path: None,
+            },
+            nas: NasConfig {
+                share_name: "GHOST".into(),
+                shard_block_size: 1_048_576, // 1MB
+                rs_data_shards: 2,
+                rs_parity_shards: 1,
+                wan_peers: vec![],
+                directory_db_path: PathBuf::from("/mnt/tank/ghost-vault/.meta/directory.enc"),
+                reconstruct_threshold: 2,
             },
         }
     }

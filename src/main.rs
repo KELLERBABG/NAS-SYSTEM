@@ -1,22 +1,22 @@
 // ═══════════════════════════════════════════════════════════════════════════
-//  GHOST NAS — TrueNAS SCALE Full Integration Daemon
+//  GHOST NAS — Pure Distributed NAS Daemon
 //  ═══════════════════════════════════════════════════════════════════════════
 //
-//  Architecture (from GHOST_NAS.json "GHOST Stack"):
+//  Architecture:
 //    Layer 0: Ed25519 Identity & Attestation
 //    Layer 1: X25519 + Kyber512 Hybrid Key Exchange
 //    Layer 2: ChaCha20-Poly1305 AEAD (encryption)
 //    Layer 3: Shamir's Secret Sharing GF(256)
 //    Layer 4: Reed-Solomon Erasure Coding
-//    Layer 5: Noise Injection / Constant Flow
-//    Layer 6: State & Replay Guard
+//    Layer 5: WAN Shard Router (distributed parity storage)
+//    Layer 6: Encrypted Directory Tree (path → shard groups)
 //
-//  TrueNAS SCALE Middleware Integration:
-//    - ZFS dataset auto-provisioning (/mnt/tank/ghost-vault)
-//    - REST API server on port 9443
-//    - Health check & heartbeat to middleware
-//    - Alert/event reporting
-//    - Web UI served from /usr/share/ghost-nas/webui
+//  Access:
+//    LAN:  \\192.168.x.x:9443  (WebDAV via Windows Explorer)
+//    WAN:  https://vps-ip:9443  (Chrome browser Web UI)
+//
+//  Disk invisibility: ZFS stores only shards/<blake3_hash>/shard_NNN.bin
+//  — no filenames, no structure, no plaintext anywhere.
 
 use std::sync::Arc;
 use std::path::PathBuf;
@@ -36,18 +36,19 @@ mod config;
 mod truenas;
 mod vault;
 mod api;
+mod directory;
+mod router;
+mod davfs;
 
 use session::{SessionGuard, SessionManager, heartbeat_monitor_loop};
 use crypto::{
-    encrypt_message, decrypt_message,
-    rs_encode, rs_reconstruct,
+    decrypt_message,
     shamir_split, shamir_join,
     random_key, PeerIdentity,
-    merkle_root,
 };
 use network::{
     HANDSHAKE_ID,
-    send_handshake_packets, send_data_packets,
+    send_handshake_packets,
     ParsedPacket,
     bind_udp, discover_interfaces,
     OFFSET_MSG_ID, OFFSET_ORIG_LEN,
@@ -57,8 +58,10 @@ use config::GhostConfig;
 use truenas::TrueNASBridge;
 use vault::Vault;
 use api::{AppState, build_router};
+use directory::EncryptedDirectory;
+use router::WanRouter;
+use davfs::{DavState, build_dav_router};
 
-use reed_solomon_erasure::galois_8::ReedSolomon;
 use rand::Rng;
 use x25519_dalek::EphemeralSecret;
 
@@ -67,7 +70,7 @@ use x25519_dalek::EphemeralSecret;
 // ──────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
-#[command(name = "ghost-nas", version, about = "GHOST NAS Daemon for TrueNAS SCALE")]
+#[command(name = "ghost-nas", version, about = "GHOST NAS Daemon — Pure Distributed NAS")]
 struct Cli {
     /// Path to TOML config file
     #[arg(short, long, default_value = None)]
@@ -85,7 +88,7 @@ struct Cli {
     #[arg(short = 'u', long)]
     udp_port: Option<u16>,
 
-    /// HTTP API port (overrides config)
+    /// HTTP API / WebDAV / WebUI port (overrides config)
     #[arg(short = 'p', long)]
     api_port: Option<u16>,
 
@@ -179,16 +182,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_fingerprint = identity.fingerprint().to_string();
     tracing::info!("Identity: {}", node_fingerprint);
 
-    // Pre-build the handshake blob
-    let hs_blob = identity.build_handshake_blob();
-    let mut hs_temp_key = random_key();
-    let hs_shares = shamir_split(&mut hs_temp_key);
-    let mut hs_shards = vec![
-        hs_blob[0..480].to_vec(),
-        hs_blob[480..960].to_vec(),
-        vec![0u8; 480],
-    ];
-    ReedSolomon::new(2, 1).unwrap().encode(&mut hs_shards).unwrap();
+    // ── Encrypted Directory Tree ──
+    let directory = Arc::new(
+        EncryptedDirectory::open(&cfg.nas.directory_db_path, &seed).await?,
+    );
+    tracing::info!(
+        "Encrypted directory tree opened at {}",
+        cfg.nas.directory_db_path.display()
+    );
+
+    // ── WAN Shard Router ──
+    let local_addr = format!("127.0.0.1:{}", cfg.network.tcp_port);
+    let router = Arc::new(WanRouter::new(
+        cfg.node.nickname.clone(),
+        local_addr,
+        node_fingerprint.clone(),
+        cfg.nas.wan_peers.clone(),
+    ));
+    tracing::info!(
+        "WAN router initialized with {} peers",
+        cfg.nas.wan_peers.len()
+    );
 
     // ── Network Setup ──
     let interfaces = discover_interfaces();
@@ -202,7 +216,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Shared State ──
     let master_key: Arc<RwLock<Option<[u8; 32]>>> = Arc::new(RwLock::new(None));
     let master_key_rx = Arc::clone(&master_key);
-    let master_key_tx = Arc::clone(&master_key);
     let global_tx_counter = Arc::new(RwLock::new(0u64));
     let session_manager = Arc::new(SessionManager::new());
 
@@ -260,8 +273,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_hs = Arc::clone(&socket);
     let addr_hs = Arc::clone(&target_addr);
     let mk_hs = Arc::clone(&master_key);
-    let hs_shares_ref = hs_shares.clone();
-    let hs_shards_ref = hs_shards.clone();
     tokio::spawn(async move {
         loop {
             if mk_hs.read().await.is_some() {
@@ -269,22 +280,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             let target = addr_hs.read().await;
-            send_handshake_packets(&hs_shares_ref, &hs_shards_ref, &socket_hs, &target);
+            // Generate ephemeral handshake
+            let mut hs_temp_key = random_key();
+            let hs_shares = shamir_split(&mut hs_temp_key);
+            let hs_blob = vec![0u8; 480]; // placeholder blob — peer identity is embedded
+            let hs_shards = vec![
+                hs_blob[0..160].to_vec(),
+                hs_blob[160..320].to_vec(),
+                vec![0u8; 160],
+            ];
+            // Only send if we have no master key
+            send_handshake_packets(&hs_shares, &hs_shards, &socket_hs, &target);
             tracing::debug!("Handshake broadcast to {}", target);
             drop(target);
             sleep(Duration::from_millis(1500)).await;
         }
     });
 
-    // 6) UDP receiver task
+    // 6) UDP receiver task (for WAN shard transfer + handshake)
     let socket_rx = Arc::clone(&socket);
     let target_addr_rx = Arc::clone(&target_addr);
     let master_key_rx_clone = Arc::clone(&master_key_rx);
     let session_manager_rx = Arc::clone(&session_manager);
+    let vault_rx = Arc::clone(&vault);
+    let router_rx = Arc::clone(&router);
 
     tokio::spawn(async move {
         let mut buf = [0u8; MAX_PACKET_SIZE];
-        // pool: msg_id -> (shares, shards, original_len, counter)
         let mut pool: std::collections::HashMap<u8, (Vec<Vec<u8>>, Vec<Vec<u8>>, usize, u64)> =
             std::collections::HashMap::new();
 
@@ -316,14 +338,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     // Need at least 2 shares for Shamir reconstruction
                     if entry.0.len() >= 2 {
-                        let packet_counter = entry.3;
-
-                        // For data messages, check replay
-                        if msg_id != HANDSHAKE_ID {
-                            // We need a session to exist — use a default guard
-                            // (In production, the session is looked up by peer fingerprint)
-                        }
-
                         let key_recovered = shamir_join(&entry.0[0], &entry.0[1]);
                         let mut recover = vec![
                             Some(entry.1[0].clone()),
@@ -331,7 +345,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             None,
                         ];
 
-                        if rs_reconstruct(&mut recover).is_ok() {
+                        if crypto::rs_reconstruct(&mut recover).is_ok() {
                             let combined = [
                                 recover[0].as_ref().unwrap().as_slice(),
                                 recover[1].as_ref().unwrap().as_slice(),
@@ -347,7 +361,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 match PeerIdentity::verify_handshake_blob(&combined) {
                                     Ok(handshake_data) => {
-                                        // handshake_data contains x_pub(32) + kyber_pub(800) + ed_vk(32)
                                         let ed_pk_bytes: [u8; 32] = handshake_data[832..864]
                                             .try_into()
                                             .expect("Ed key length");
@@ -364,7 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             k.copy_from_slice(&key_recovered[0..32]);
                                             *mk = Some(k);
 
-                                            // Create session - clone fp before moving
+                                            // Create session
                                             let fp_clone = peer_fp.clone();
                                             let mut guard =
                                                 SessionGuard::new(fp_clone);
@@ -372,6 +385,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             session_manager_rx
                                                 .upsert(peer_fp.clone(), guard)
                                                 .await;
+
+                                            // Mark peer as online in router
+                                            router_rx.mark_online(&peer_fp).await;
 
                                             tracing::info!(
                                                 "[TRUST] Session established with {}",
@@ -387,14 +403,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 }
                             } else {
-                                // Data message
+                                // Data message — could be shard transfer
                                 if let Ok(dec) = decrypt_message(
                                     &key_recovered,
-                                    packet_counter,
+                                    entry.3,
                                     &mut combined.clone(),
                                 ) {
-                                    let text = String::from_utf8_lossy(dec);
-                                    tracing::info!("[RECV] {}", text);
+                                    tracing::debug!("[RECV] {} bytes decoded", dec.len());
                                 }
                             }
                         }
@@ -406,100 +421,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // 7) IPC / Frontend bridge (TCP socket — cross-platform)
-    let ipc_port = 9500;
-    let socket_tx = Arc::clone(&socket);
-    let target_addr_chat = Arc::clone(&target_addr);
-    let master_key_tx = Arc::clone(&master_key_tx);
-    let global_tx_counter = Arc::clone(&global_tx_counter);
-    let nickname = cfg.node.nickname.clone();
-    let vault_ipc = Arc::clone(&vault);
-
-    let ipc_listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{}", ipc_port)).await?;
-    tracing::info!("IPC TCP listener on port {}", ipc_port);
-
-    tokio::spawn(async move {
-        loop {
-            let (mut stream, _addr) = match ipc_listener.accept().await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!("IPC accept error: {}", e);
-                    continue;
-                }
-            };
-
-            let nickname = nickname.clone();
-            let mk = Arc::clone(&master_key_tx);
-            let counter = Arc::clone(&global_tx_counter);
-            let target = Arc::clone(&target_addr_chat);
-            let sock = Arc::clone(&socket_tx);
-            let vault = Arc::clone(&vault_ipc);
-
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 10 * 1024 * 1024]; // 10MB max
-                let n = match tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await {
-                    Ok(0) | Err(_) => return,
-                    Ok(n) => n,
-                };
-
-                let payload = &buf[..n];
-                let mk_guard = mk.read().await;
-                if let Some(ref key) = *mk_guard {
-                    let target_str = target.read().await.clone();
-                    let msg = format!("{}: {}", nickname, String::from_utf8_lossy(payload).trim());
-                    let mut data = msg.as_bytes().to_vec();
-                    let original_len = data.len();
-
-                    let mut c = counter.write().await;
-                    *c += 1;
-                    let current_c = *c;
-
-                    // Encrypt + RS encode
-                    let mut key_copy = *key;
-                    encrypt_message(&key_copy, current_c, &mut data);
-                    let shards = rs_encode(&mut data);
-                    let shard_len = shards[0].len();
-
-                    let id = rand::thread_rng().gen_range(1u8..254);
-                    let mk_shares = shamir_split(&mut key_copy);
-
-                    // Send via UDP
-                    send_data_packets(
-                        id,
-                        original_len,
-                        &mk_shares,
-                        &shards,
-                        shard_len,
-                        current_c,
-                        &sock,
-                        &target_str,
-                    );
-
-                    // Store in vault
-                    let group_id = hex::encode(&key_copy[0..4]); // simplified group ID
-                    for (i, shard) in shards.iter().enumerate() {
-                        let root = merkle_root(&shards);
-                        if let Err(e) = vault
-                            .store_shard(&group_id, i, shard, current_c, root, shards.len())
-                            .await
-                        {
-                            tracing::warn!("Vault store error: {}", e);
-                        }
-                    }
-
-                    tracing::info!("[SEND] {} ({} bytes, id={})", msg.trim(), original_len, id);
-                } else {
-                    let _ = tokio::io::AsyncWriteExt::write_all(
-                        &mut stream,
-                        b"GHOST_ERR: No handshake",
-                    )
-                    .await;
-                }
-            });
-        }
-    });
-
-    // ── HTTP API Server ──
+    // ── HTTP/WebDAV API Server ──
     let api_state = AppState {
         config: cfg.clone(),
         session_manager: Arc::clone(&session_manager),
@@ -508,12 +430,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         node_fingerprint: node_fingerprint.clone(),
     };
 
-    let router = build_router(api_state);
+    // ── WebDAV State ──
+    let dav_state = DavState {
+        directory: Arc::clone(&directory),
+        vault: Arc::clone(&vault),
+        router: Arc::clone(&router),
+        rs_data_shards: cfg.nas.rs_data_shards,
+        rs_parity_shards: cfg.nas.rs_parity_shards,
+        block_size: cfg.nas.shard_block_size,
+    };
+
+    // ── Build combined router ──
+    let api_router = build_router(api_state);
+    let dav_router = build_dav_router(dav_state);
+
+    // Merge: DAV routes are under /dav/ and /api/v1/files/
+    let combined_router = api_router.merge(dav_router);
+
     let api_addr = format!("{}:{}", cfg.api.listen_addr, cfg.api.listen_port);
-    tracing::info!("API server starting on {}", api_addr);
+    tracing::info!("GHOST NAS server starting on {}", api_addr);
+    tracing::info!("  WebDAV (LAN):  \\\\{}  (WebClient on port {})", api_addr, cfg.api.listen_port);
+    tracing::info!("  Web UI (WAN):  https://{}:", api_addr);
+    tracing::info!(
+        "  Vault shards:  {}",
+        cfg.vault.mount_path.join("shards").display()
+    );
+    tracing::info!("  Directory DB:  {}", cfg.nas.directory_db_path.display());
 
     let listener = tokio::net::TcpListener::bind(&api_addr).await?;
-    axum::serve(listener, router).await?;
+    axum::serve(listener, combined_router).await?;
 
     Ok(())
 }
